@@ -38,6 +38,12 @@ type ToolCall = {
 type AiResponse = {
   response?: string;
   tool_calls?: ToolCall[];
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+      tool_calls?: ToolCall[];
+    };
+  }>;
 };
 
 const MAX_HISTORY_MESSAGES = 12;
@@ -360,14 +366,19 @@ async function runAgent(env: RuntimeEnv, chatId: number, prompt: string): Promis
       tools,
       max_tokens: 3500,
     }) as AiResponse;
-    const calls = Array.isArray(result.tool_calls) ? result.tool_calls : [];
+    const choiceMessage = result.choices?.[0]?.message;
+    const calls = Array.isArray(choiceMessage?.tool_calls)
+      ? choiceMessage.tool_calls
+      : Array.isArray(result.tool_calls)
+        ? result.tool_calls
+        : [];
     if (!calls.length) {
-      finalText = String(result.response || finalText).trim();
+      finalText = String(result.response || choiceMessage?.content || finalText).trim();
       break;
     }
     messages.push({
       role: "assistant",
-      content: String(result.response || ""),
+      content: String(result.response || choiceMessage?.content || ""),
       tool_calls: calls,
     });
     for (let index = 0; index < calls.length; index += 1) {
