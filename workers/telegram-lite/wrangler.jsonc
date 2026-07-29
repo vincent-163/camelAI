@@ -1,0 +1,31 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "camelai-telegram-172a28c1",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "vars": {
+    "ALLOWED_CHAT_ID": "524019827",
+    "GITHUB_OWNER": "vincent-163",
+    "GITHUB_REPO": "camelAI",
+    "GITHUB_BRANCH": "main",
+    "AI_MODEL": "@cf/qwen/qwen3-30b-a3b-fp8"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SESSIONS",
+      "id": "7fe6d23000504cb0bece21341942f71e"
+    }
+  ]
+}
