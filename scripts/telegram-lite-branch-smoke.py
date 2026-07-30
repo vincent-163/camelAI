@@ -17,6 +17,7 @@ def telegram(method: str, data: dict[str, object]) -> dict[str, object]:
     request = urllib.request.Request(
         f"{API}/{method}",
         data=urllib.parse.urlencode(data).encode(),
+        headers={"User-Agent": "curl/8.0"},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -44,6 +45,7 @@ def post_update(message_id: int, text: str, reply_to_message_id: int | None = No
         data=json.dumps({"update_id": time.time_ns(), "message": message}).encode(),
         headers={
             "content-type": "application/json",
+            "User-Agent": "curl/8.0",
             "x-telegram-bot-api-secret-token": WEBHOOK_SECRET,
         },
         method="POST",
