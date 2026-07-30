@@ -50,6 +50,25 @@ type AiResponse = {
   }>;
 };
 
+type AiStreamChunk = {
+  response?: string;
+  choices?: Array<{
+    delta?: {
+      content?: string | null;
+      tool_calls?: Array<{
+        index?: number;
+        id?: string;
+        function?: { name?: string; arguments?: string };
+      }>;
+    };
+    message?: AiResponse["choices"] extends Array<infer Choice>
+      ? Choice extends { message?: infer Message }
+        ? Message
+        : never
+      : never;
+  }>;
+};
+
 type SessionStatus = "idle" | "running" | "done" | "error";
 
 type ReplyMapping = {
@@ -421,7 +440,11 @@ function systemPrompt(env: RuntimeEnv): string {
   ].join("\n");
 }
 
-async function runModel(env: RuntimeEnv, messages: ChatMessage[]): Promise<AiResponse> {
+async function runModel(
+  env: RuntimeEnv,
+  messages: ChatMessage[],
+  onText?: (text: string) => Promise<void>,
+): Promise<AiResponse> {
   const response = await fetch(`${env.AI_BASE_URL.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: {
@@ -433,13 +456,75 @@ async function runModel(env: RuntimeEnv, messages: ChatMessage[]): Promise<AiRes
       messages,
       tools,
       max_tokens: 3500,
+      stream: true,
     }),
   });
-  const payload = await response.json<AiResponse & { error?: { message?: string } }>();
   if (!response.ok) {
-    throw new Error(payload.error?.message || `AI API failed (${response.status})`);
+    const text = await response.text();
+    let message = text.slice(0, 500);
+    try {
+      const payload = JSON.parse(text) as { error?: { message?: string } };
+      message = payload.error?.message || message;
+    } catch {
+      // Keep the response excerpt.
+    }
+    throw new Error(message || `AI API failed (${response.status})`);
   }
-  return payload;
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    return await response.json<AiResponse>();
+  }
+  if (!response.body) throw new Error("AI streaming response had no body");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const calls = new Map<number, ToolCall>();
+  let content = "";
+  let buffer = "";
+
+  const consumeLine = async (line: string): Promise<void> => {
+    if (!line.startsWith("data:")) return;
+    const data = line.slice(5).trim();
+    if (!data || data === "[DONE]") return;
+    const chunk = JSON.parse(data) as AiStreamChunk;
+    const delta = chunk.choices?.[0]?.delta;
+    const text = String(delta?.content || chunk.response || "");
+    if (text) {
+      content += text;
+      await onText?.(content);
+    }
+    for (const streamedCall of delta?.tool_calls || []) {
+      const index = streamedCall.index ?? 0;
+      const call = calls.get(index) || { id: streamedCall.id, function: { name: "", arguments: "" } };
+      if (streamedCall.id) call.id = streamedCall.id;
+      if (!call.function) call.function = { name: "", arguments: "" };
+      if (streamedCall.function?.name) {
+        call.function.name = `${call.function.name || ""}${streamedCall.function.name}`;
+      }
+      if (streamedCall.function?.arguments) {
+        call.function.arguments = `${call.function.arguments || ""}${streamedCall.function.arguments}`;
+      }
+      calls.set(index, call);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) await consumeLine(line);
+    if (done) break;
+  }
+  if (buffer) await consumeLine(buffer);
+  return {
+    choices: [{
+      message: {
+        content,
+        tool_calls: [...calls.entries()].sort(([left], [right]) => left - right).map(([, call]) => call),
+      },
+    }],
+  };
 }
 
 function initialSessionState(): SessionState {
@@ -472,6 +557,7 @@ export class TelegramRouter extends DurableObject<RuntimeEnv> {
 export class TelegramSession extends DurableObject<RuntimeEnv> {
   private session = initialSessionState();
   private runPromise: Promise<void> | null = null;
+  private lastProgressEditAt = 0;
 
   constructor(ctx: DurableObjectState, env: RuntimeEnv) {
     super(ctx, env);
@@ -522,6 +608,7 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
     this.session.progressMessageId = input.progressMessageId;
     this.session.updatedAt = Date.now();
     await this.persist();
+    await this.updateProgress("已接收 steering，正在调整执行方向…", "", true);
     console.log("telegram session steering queued", {
       sessionId: this.ctx.id.toString(),
       previousProgressMessageId: input.previousProgressMessageId,
@@ -550,6 +637,30 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
     return steering;
   }
 
+  private async updateProgress(stage: string, preview = "", force = false): Promise<void> {
+    const { chatId, progressMessageId, startedAt } = this.session;
+    if (chatId === null || progressMessageId === null) return;
+    const now = Date.now();
+    if (!force && now - this.lastProgressEditAt < 1_500) return;
+    this.lastProgressEditAt = now;
+    const elapsedSeconds = Math.max(0, Math.floor((now - (startedAt || now)) / 1_000));
+    const elapsed = elapsedSeconds < 60
+      ? `${elapsedSeconds}s`
+      : `${Math.floor(elapsedSeconds / 60)}m${String(elapsedSeconds % 60).padStart(2, "0")}s`;
+    const clippedPreview = preview.trim().slice(-1_500);
+    const text = [
+      `🟡 IN PROGRESS · ${elapsed}`,
+      stage,
+      clippedPreview ? `\n${clippedPreview}` : "",
+    ].join("\n");
+    await editTelegram(this.env, chatId, progressMessageId, text).catch((error) => {
+      console.warn("telegram progress edit failed", {
+        sessionId: this.ctx.id.toString(),
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
   private async runTurn(prompt: string): Promise<void> {
     const history = this.session.history.slice(-MAX_HISTORY_MESSAGES);
     const turnInputs = [prompt];
@@ -561,7 +672,15 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
     let finalText = "I could not complete the request.";
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-      const result = await runModel(this.env, messages);
+      await this.updateProgress(`正在请求模型 · round ${round + 1}/${MAX_TOOL_ROUNDS}`, "", true);
+      const result = await runModel(
+        this.env,
+        messages,
+        (partial) => this.updateProgress(
+          `模型生成中 · round ${round + 1}/${MAX_TOOL_ROUNDS}`,
+          partial,
+        ),
+      );
       const choiceMessage = result.choices?.[0]?.message;
       const candidate = String(result.response || choiceMessage?.content || finalText).trim();
       const calls = Array.isArray(choiceMessage?.tool_calls)
@@ -580,6 +699,11 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
           const call = calls[index];
           const id = toolId(call, index);
           const name = toolName(call);
+          await this.updateProgress(
+            `正在执行工具 · ${index + 1}/${calls.length}`,
+            name || "unknown tool",
+            true,
+          );
           let output: unknown;
           try {
             output = await executeTool(this.env, name, parseArguments(call));
@@ -600,6 +724,7 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
           messages.push({ role: "user", content: instruction });
         }
         await this.persist();
+        await this.updateProgress(`已合并 ${steering.length} 条 steering 指令，继续运行…`, "", true);
         continue;
       }
       if (!calls.length) break;
@@ -613,6 +738,7 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
     this.session.status = "done";
     this.session.updatedAt = Date.now();
     await this.persist();
+    await this.updateProgress("正在发送最终结果…", finalText, true);
     await this.publishFinal(finalText);
   }
 
