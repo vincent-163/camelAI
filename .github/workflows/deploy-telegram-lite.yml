@@ -47,6 +47,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CAMELAI_REPO_TOKEN: ${{ secrets.CAMELAI_REPO_TOKEN }}
           CAMELAI_AI_API_KEY: ${{ secrets.CAMELAI_AI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -91,6 +92,52 @@ jobs:
             > /tmp/audio-smoke-tail.jsonl 2>&1 &
           tail_pid=$!
           sleep 8
+          for format in opus mp3 wav; do
+            jq -n --arg format "$format" '{model:"openai/gpt-audio",messages:[{role:"user",content:"Say audio test."}],modalities:["text","audio"],audio:{voice:"alloy",format:$format},max_tokens:32,stream:true}' \
+              > "/tmp/openrouter-$format-request.json"
+            status=$(curl --silent --show-error \
+              -o "/tmp/openrouter-$format-response" \
+              -w '%{http_code}' \
+              https://openrouter.ai/api/v1/chat/completions \
+              -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+              -H 'content-type: application/json' \
+              --data-binary @"/tmp/openrouter-$format-request.json")
+            FORMAT="$format" STATUS="$status" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          fmt = os.environ["FORMAT"]
+          status = os.environ["STATUS"]
+          raw = Path(f"/tmp/openrouter-{fmt}-response").read_text(errors="replace")
+          errors = []
+          has_audio = False
+          if status == "200":
+              for line in raw.splitlines():
+                  if not line.startswith("data:"):
+                      continue
+                  data = line[5:].strip()
+                  if not data or data == "[DONE]":
+                      continue
+                  try:
+                      payload = json.loads(data)
+                  except json.JSONDecodeError:
+                      continue
+                  if payload.get("error"):
+                      errors.append(payload["error"])
+                  audio = ((payload.get("choices") or [{}])[0].get("delta") or {}).get("audio") or {}
+                  has_audio = has_audio or bool(audio.get("data"))
+          else:
+              try:
+                  payload = json.loads(raw)
+                  if payload.get("error"):
+                      errors.append(payload["error"])
+              except json.JSONDecodeError:
+                  errors.append({"message": raw[:200]})
+          safe_errors = [{"code": item.get("code"), "message": item.get("message"), "metadata": item.get("metadata")} for item in errors]
+          print(json.dumps({"format": fmt, "status": status, "has_audio": has_audio, "errors": safe_errors}, ensure_ascii=False))
+          PY
+          done
           seed_id=$(curl --fail-with-body --silent --show-error -X POST "$api/sendMessage" \
             --data-urlencode "chat_id=$chat_id" \
             --data-urlencode 'text=camelAI /audio smoke test' | jq -r '.result.message_id')

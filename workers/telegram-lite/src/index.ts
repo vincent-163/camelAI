@@ -83,6 +83,11 @@ type AiStreamChunk = {
 };
 
 type AudioStreamChunk = {
+  error?: {
+    code?: string | number;
+    message?: string;
+    metadata?: Record<string, unknown>;
+  };
   choices?: Array<{
     delta?: {
       content?: string | null;
@@ -676,8 +681,8 @@ async function runOpenRouterAudio(
     const raw = await response.text();
     let message = raw.slice(0, 500);
     try {
-      const payload = JSON.parse(raw) as { error?: { message?: string } };
-      message = payload.error?.message || message;
+      const payload = JSON.parse(raw) as AudioStreamChunk;
+      message = formatOpenRouterError(payload.error, message);
     } catch {
       // Keep the response excerpt.
     }
@@ -697,6 +702,7 @@ async function runOpenRouterAudio(
     const data = line.slice(5).trim();
     if (!data || data === "[DONE]") return;
     const chunk = JSON.parse(data) as AudioStreamChunk;
+    if (chunk.error) throw new Error(formatOpenRouterError(chunk.error, "OpenRouter provider error"));
     const delta = chunk.choices?.[0]?.delta;
     if (delta?.content) content += delta.content;
     if (delta?.audio?.transcript) transcript += delta.audio.transcript;
@@ -713,6 +719,22 @@ async function runOpenRouterAudio(
   }
   if (buffer) consumeLine(buffer);
   return { text: (content || transcript).trim(), audio: concatBytes(audioChunks) };
+}
+
+function formatOpenRouterError(
+  error: AudioStreamChunk["error"],
+  fallback: string,
+): string {
+  if (!error) return fallback;
+  const metadata = error.metadata || {};
+  const provider = typeof metadata.provider_name === "string" ? metadata.provider_name : "";
+  const raw = typeof metadata.raw === "string" ? metadata.raw.slice(0, 240) : "";
+  return [
+    error.message || fallback,
+    error.code === undefined ? "" : `code=${error.code}`,
+    provider ? `provider=${provider}` : "",
+    raw,
+  ].filter(Boolean).join(" · ");
 }
 
 async function transcribeTelegramAudio(
