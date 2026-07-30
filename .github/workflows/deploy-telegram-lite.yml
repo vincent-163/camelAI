@@ -86,7 +86,7 @@ jobs:
           chat_id=524019827
           api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
           worker='https://camelai-telegram-172a28c1.ouihfugxhcqe.workers.dev/telegram/webhook'
-          timeout 110 npm exec --yes wrangler@4.115.0 -- tail \
+          timeout 230 npm exec --yes wrangler@4.115.0 -- tail \
             --format json \
             --config workers/telegram-lite/wrangler.jsonc \
             > /tmp/audio-smoke-tail.jsonl 2>&1 &
@@ -162,6 +162,7 @@ jobs:
           sleep 75
           found_text=0
           found_voice=0
+          voice_file_id=''
           for candidate in $(seq $((seed_id + 1)) $((seed_id + 8))); do
             payload=$(curl --silent -X POST "$api/forwardMessage" \
               --data-urlencode "chat_id=$chat_id" \
@@ -180,23 +181,72 @@ jobs:
                 *) bot_message_ids="$bot_message_ids $candidate" ;;
               esac
             fi
-            jq -r '["candidate", (.result.message_id|tostring), "text", ((.result.text // "")|.[0:160]), "audio", ((.result.audio.file_id? // "")|length|tostring)] | @tsv' <<<"$payload"
+            jq -r '["candidate", (.result.message_id|tostring), "text", ((.result.text // "")|.[0:160]), "voice", ((.result.voice.file_id? // "")|length|tostring)] | @tsv' <<<"$payload"
             if jq -e '.result.text // "" | contains("语音测试成功")' <<<"$payload" >/dev/null; then
               found_text=1
             fi
-            if jq -e '.result.audio.file_id | length > 0' <<<"$payload" >/dev/null 2>&1; then
+            if jq -e '.result.voice.file_id | length > 0' <<<"$payload" >/dev/null 2>&1; then
               found_voice=1
+              voice_file_id=$(jq -r '.result.voice.file_id' <<<"$payload")
             fi
           done
-          if (( found_text == 1 && found_voice == 1 )); then
+          if (( found_text == 1 && found_voice == 1 )) && [[ -n "$voice_file_id" ]]; then
+            voice_seed_id=$(curl --fail-with-body --silent --show-error -X POST "$api/sendMessage" \
+              --data-urlencode "chat_id=$chat_id" \
+              --data-urlencode 'text=camelAI end-to-end voice input smoke test' | jq -r '.result.message_id')
+            bot_message_ids="$bot_message_ids $voice_seed_id"
+            jq -n \
+              --argjson message_id "$voice_seed_id" \
+              --argjson chat_id "$chat_id" \
+              --arg file_id "$voice_file_id" \
+              '{update_id:(now|floor),message:{message_id:$message_id,chat:{id:$chat_id},from:{id:$chat_id,first_name:"Voice Smoke"},caption:"请只回答：端到端语音输入成功。",voice:{file_id:$file_id,duration:2,mime_type:"audio/ogg"}}}' \
+              > /tmp/voice-input-smoke-update.json
+            curl --fail-with-body --silent --show-error -X POST "$worker" \
+              -H "x-telegram-bot-api-secret-token: $TELEGRAM_WEBHOOK_SECRET" \
+              -H 'content-type: application/json' \
+              --data-binary @/tmp/voice-input-smoke-update.json >/dev/null
+            sleep 75
+            input_text=0
+            input_voice=0
+            for candidate in $(seq $((voice_seed_id + 1)) $((voice_seed_id + 8))); do
+              payload=$(curl --silent -X POST "$api/forwardMessage" \
+                --data-urlencode "chat_id=$chat_id" \
+                --data-urlencode "from_chat_id=$chat_id" \
+                --data-urlencode "message_id=$candidate")
+              if ! jq -e '.ok == true' <<<"$payload" >/dev/null; then
+                continue
+              fi
+              forwarded_id=$(jq -r '.result.message_id' <<<"$payload")
+              curl --silent -X POST "$api/deleteMessage" \
+                --data-urlencode "chat_id=$chat_id" \
+                --data-urlencode "message_id=$forwarded_id" >/dev/null || true
+              if jq -e '.result.from.is_bot == true' <<<"$payload" >/dev/null; then
+                case " $bot_message_ids " in
+                  *" $candidate "*) ;;
+                  *) bot_message_ids="$bot_message_ids $candidate" ;;
+                esac
+              fi
+              jq -r '["voice-input-candidate", (.result.message_id|tostring), "text", ((.result.text // "")|.[0:160]), "voice", ((.result.voice.file_id? // "")|length|tostring)] | @tsv' <<<"$payload"
+              if jq -e '.result.text // "" | contains("端到端语音输入成功")' <<<"$payload" >/dev/null; then
+                input_text=1
+              fi
+              if jq -e '.result.voice.file_id | length > 0' <<<"$payload" >/dev/null 2>&1; then
+                input_voice=1
+              fi
+            done
+          else
+            input_text=0
+            input_voice=0
+          fi
+          if (( found_text == 1 && found_voice == 1 && input_text == 1 && input_voice == 1 )); then
             kill "$tail_pid" >/dev/null 2>&1 || true
             wait "$tail_pid" >/dev/null 2>&1 || true
-            echo "Telegram /audio smoke passed: text and playable audio received"
+            echo "Telegram audio smoke passed: /audio and end-to-end voice input both returned voice notes"
             exit 0
           fi
           kill "$tail_pid" >/dev/null 2>&1 || true
           wait "$tail_pid" >/dev/null 2>&1 || true
           echo '--- Worker tail ---'
           tail -200 /tmp/audio-smoke-tail.jsonl
-          echo "Telegram /audio smoke failed: text=$found_text voice=$found_voice" >&2
+          echo "Telegram audio smoke failed: audio_text=$found_text audio_voice=$found_voice input_text=$input_text input_voice=$input_voice" >&2
           exit 1

@@ -1,6 +1,7 @@
 /// <reference path="../worker-configuration.d.ts" />
 
 import { DurableObject } from "cloudflare:workers";
+import { Application, Signal, createDecoder, createEncoder } from "libopus-wasm";
 
 type RuntimeEnv = Env & {
   TELEGRAM_BOT_TOKEN: string;
@@ -35,9 +36,13 @@ type TelegramUpdate = {
   message?: TelegramMessage;
 };
 
+type AudioContentPart =
+  | { type: "text"; text: string }
+  | { type: "input_audio"; input_audio: { data: string; format: "wav" | "mp3" } };
+
 type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
-  content: string;
+  content: string | AudioContentPart[];
   tool_call_id?: string;
   tool_calls?: unknown[];
 };
@@ -115,7 +120,14 @@ type UserTurn = {
 
 type GeneratedAudio = {
   bytes: Uint8Array;
-  format: "wav";
+  format: "ogg" | "wav";
+  telegramKind: "voice" | "audio";
+};
+
+type PreparedTurn = {
+  displayText: string;
+  content: ChatMessage["content"];
+  audioMode: boolean;
 };
 
 type SessionStatus = "idle" | "running" | "done" | "error";
@@ -389,6 +401,200 @@ function pcm16ToWav(pcm: Uint8Array, sampleRate = 24_000, channels = 1): Uint8Ar
   return wav;
 }
 
+function startsWithAscii(bytes: Uint8Array, value: string): boolean {
+  if (bytes.length < value.length) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (bytes[index] !== value.charCodeAt(index)) return false;
+  }
+  return true;
+}
+
+function parseOggPackets(ogg: Uint8Array): { packets: Uint8Array[]; finalGranule: bigint | null } {
+  const packets: Uint8Array[] = [];
+  let packetParts: Uint8Array[] = [];
+  let finalGranule: bigint | null = null;
+  let offset = 0;
+  while (offset + 27 <= ogg.length) {
+    if (!startsWithAscii(ogg.subarray(offset, offset + 4), "OggS")) {
+      throw new Error("无效的 OGG 容器");
+    }
+    const segmentCount = ogg[offset + 26];
+    const headerLength = 27 + segmentCount;
+    if (offset + headerLength > ogg.length) throw new Error("OGG 页头不完整");
+    const granule = new DataView(ogg.buffer, ogg.byteOffset + offset, 27).getBigUint64(6, true);
+    if (granule !== 0xffffffffffffffffn) finalGranule = granule;
+    let payloadOffset = offset + headerLength;
+    let payloadLength = 0;
+    for (let index = 0; index < segmentCount; index += 1) payloadLength += ogg[offset + 27 + index];
+    if (payloadOffset + payloadLength > ogg.length) throw new Error("OGG 页数据不完整");
+    for (let index = 0; index < segmentCount; index += 1) {
+      const length = ogg[offset + 27 + index];
+      packetParts.push(ogg.subarray(payloadOffset, payloadOffset + length));
+      payloadOffset += length;
+      if (length < 255) {
+        packets.push(concatBytes(packetParts));
+        packetParts = [];
+      }
+    }
+    offset += headerLength + payloadLength;
+  }
+  if (packetParts.length) throw new Error("OGG 最后一个 Opus packet 不完整");
+  return { packets, finalGranule };
+}
+
+async function oggOpusToWav(ogg: Uint8Array): Promise<Uint8Array> {
+  const { packets, finalGranule } = parseOggPackets(ogg);
+  const head = packets.find((packet) => startsWithAscii(packet, "OpusHead"));
+  if (!head || head.length < 19) throw new Error("OGG 中缺少有效 OpusHead");
+  const channels = head[9] === 2 ? 2 : 1;
+  const preSkip = new DataView(head.buffer, head.byteOffset, head.byteLength).getUint16(10, true);
+  const decoder = await createDecoder({ sampleRate: 48_000, channels });
+  try {
+    const decoded: Int16Array[] = [];
+    for (const packet of packets) {
+      if (startsWithAscii(packet, "OpusHead") || startsWithAscii(packet, "OpusTags")) continue;
+      decoded.push(decoder.decode(packet));
+    }
+    if (!decoded.length) throw new Error("OGG 中没有可解码的 Opus 音频包");
+    const totalSamples = decoded.reduce((sum, frame) => sum + frame.length, 0);
+    const availableSamples = Math.max(0, totalSamples - preSkip * channels);
+    const granuleSamples = finalGranule === null
+      ? availableSamples
+      : Math.max(0, Number(finalGranule - BigInt(preSkip)) * channels);
+    const pcm = new Int16Array(Math.min(availableSamples, granuleSamples));
+    let writeOffset = 0;
+    let skip = preSkip * channels;
+    for (const frame of decoded) {
+      const start = Math.min(skip, frame.length);
+      skip -= start;
+      const copyLength = Math.min(frame.length - start, pcm.length - writeOffset);
+      if (copyLength <= 0) break;
+      pcm.set(frame.subarray(start, start + copyLength), writeOffset);
+      writeOffset += copyLength;
+    }
+    const pcmBytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    return pcm16ToWav(pcmBytes, 48_000, channels);
+  } finally {
+    decoder.free();
+  }
+}
+
+function oggCrc(bytes: Uint8Array): number {
+  let crc = 0;
+  for (const byte of bytes) {
+    crc ^= byte << 24;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 0x80000000) ? ((crc << 1) ^ 0x04c11db7) : (crc << 1);
+    }
+  }
+  return crc >>> 0;
+}
+
+function createOggPage(
+  packet: Uint8Array,
+  headerType: number,
+  granulePosition: bigint,
+  serial: number,
+  sequence: number,
+): Uint8Array {
+  const lacing: number[] = [];
+  for (let remaining = packet.length; remaining >= 255; remaining -= 255) lacing.push(255);
+  lacing.push(packet.length % 255);
+  const headerLength = 27 + lacing.length;
+  const page = new Uint8Array(headerLength + packet.length);
+  const view = new DataView(page.buffer);
+  page.set([0x4f, 0x67, 0x67, 0x53], 0);
+  page[4] = 0;
+  page[5] = headerType;
+  view.setBigUint64(6, granulePosition, true);
+  view.setUint32(14, serial, true);
+  view.setUint32(18, sequence, true);
+  view.setUint32(22, 0, true);
+  page[26] = lacing.length;
+  page.set(lacing, 27);
+  page.set(packet, headerLength);
+  view.setUint32(22, oggCrc(page), true);
+  return page;
+}
+
+function opusHead(sampleRate: number, preSkip: number): Uint8Array {
+  const head = new Uint8Array(19);
+  const view = new DataView(head.buffer);
+  head.set(new TextEncoder().encode("OpusHead"), 0);
+  head[8] = 1;
+  head[9] = 1;
+  view.setUint16(10, preSkip, true);
+  view.setUint32(12, sampleRate, true);
+  view.setInt16(16, 0, true);
+  head[18] = 0;
+  return head;
+}
+
+function opusTags(): Uint8Array {
+  const vendor = new TextEncoder().encode("camelAI Telegram Lite");
+  const tags = new Uint8Array(16 + vendor.length);
+  const view = new DataView(tags.buffer);
+  tags.set(new TextEncoder().encode("OpusTags"), 0);
+  view.setUint32(8, vendor.length, true);
+  tags.set(vendor, 12);
+  view.setUint32(12 + vendor.length, 0, true);
+  return tags;
+}
+
+async function pcm16ToOggOpus(pcmBytes: Uint8Array): Promise<Uint8Array> {
+  const sampleRate = 24_000;
+  const frameSize = 480;
+  const source = new Int16Array(
+    pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength),
+  );
+  const encoder = await createEncoder({
+    sampleRate,
+    channels: 1,
+    application: Application.Voip,
+    signal: Signal.Voice,
+    bitrate: 24_000,
+    complexity: 5,
+    frameSize,
+    vbr: true,
+  });
+  try {
+    const preSkip = Math.round(encoder.getLookahead() * 48_000 / sampleRate);
+    const packets: Uint8Array[] = [];
+    for (let offset = 0; offset < source.length; offset += frameSize) {
+      const frame = new Int16Array(frameSize);
+      frame.set(source.subarray(offset, Math.min(offset + frameSize, source.length)));
+      packets.push(encoder.encode(frame));
+    }
+    if (!packets.length) throw new Error("语音生成未返回可编码样本");
+    const serial = crypto.getRandomValues(new Uint32Array(1))[0];
+    const pages: Uint8Array[] = [
+      createOggPage(opusHead(sampleRate, preSkip), 0x02, 0n, serial, 0),
+      createOggPage(opusTags(), 0x00, 0n, serial, 1),
+    ];
+    for (let index = 0; index < packets.length; index += 1) {
+      const isLast = index === packets.length - 1;
+      const granule = isLast
+        ? BigInt(preSkip + source.length * 2)
+        : BigInt(preSkip + (index + 1) * 960);
+      pages.push(createOggPage(packets[index], isLast ? 0x04 : 0x00, granule, serial, index + 2));
+    }
+    return concatBytes(pages);
+  } finally {
+    encoder.free();
+  }
+}
+
+async function generatedVoice(pcmBytes: Uint8Array): Promise<GeneratedAudio> {
+  try {
+    return { bytes: await pcm16ToOggOpus(pcmBytes), format: "ogg", telegramKind: "voice" };
+  } catch (error) {
+    console.warn("opus voice encoding failed; falling back to wav", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { bytes: pcm16ToWav(pcmBytes), format: "wav", telegramKind: "audio" };
+  }
+}
+
 async function downloadTelegramAudio(env: RuntimeEnv, source: AudioSource): Promise<Uint8Array> {
   if (source.declaredSize && source.declaredSize > MAX_AUDIO_BYTES) {
     throw new Error(`语音文件过大，最大支持 ${Math.floor(MAX_AUDIO_BYTES / 1_000_000)} MB。`);
@@ -415,6 +621,20 @@ async function downloadTelegramAudio(env: RuntimeEnv, source: AudioSource): Prom
   return bytes;
 }
 
+async function prepareAudioForGpt(env: RuntimeEnv, source: AudioSource): Promise<{
+  data: string;
+  format: "wav" | "mp3";
+}> {
+  const bytes = await downloadTelegramAudio(env, source);
+  if (source.format === "wav" || source.format === "mp3") {
+    return { data: bytesToBase64(bytes), format: source.format };
+  }
+  if (source.format !== "ogg") {
+    throw new Error("端到端语音目前支持 Telegram OGG/Opus、WAV 和 MP3。");
+  }
+  return { data: bytesToBase64(await oggOpusToWav(bytes)), format: "wav" };
+}
+
 async function sendTelegramAudio(
   env: RuntimeEnv,
   chatId: number,
@@ -425,10 +645,13 @@ async function sendTelegramAudio(
   body.set("chat_id", String(chatId));
   if (replyToMessageId) body.set("reply_to_message_id", String(replyToMessageId));
   const audioBuffer = Uint8Array.from(audio.bytes).buffer;
-  body.set("audio", new Blob([audioBuffer], { type: "audio/wav" }), `camelai.${audio.format}`);
-  const payload = await telegramMultipartRequest(env, "sendAudio", body);
+  const field = audio.telegramKind === "voice" ? "voice" : "audio";
+  const method = audio.telegramKind === "voice" ? "sendVoice" : "sendAudio";
+  const mimeType = audio.telegramKind === "voice" ? "audio/ogg" : "audio/wav";
+  body.set(field, new Blob([audioBuffer], { type: mimeType }), `camelai.${audio.format}`);
+  const payload = await telegramMultipartRequest(env, method, body);
   const messageId = payload.result?.message_id;
-  if (typeof messageId !== "number") throw new Error("Telegram sendAudio returned no message id");
+  if (typeof messageId !== "number") throw new Error(`Telegram ${method} returned no message id`);
   return messageId;
 }
 
@@ -764,35 +987,6 @@ function formatOpenRouterError(
   ].filter(Boolean).join(" · ");
 }
 
-async function transcribeTelegramAudio(
-  env: RuntimeEnv,
-  source: AudioSource,
-  caption: string,
-): Promise<string> {
-  const bytes = await downloadTelegramAudio(env, source);
-  const instruction = [
-    "Transcribe the attached audio accurately.",
-    "Return only the transcript in the original spoken language, without commentary or markdown.",
-    caption ? `The sender included this caption for context: ${caption}` : "",
-  ].filter(Boolean).join("\n");
-  const result = await runOpenRouterAudio(env, {
-    messages: [{
-      role: "user",
-      content: [
-        { type: "text", text: instruction },
-        {
-          type: "input_audio",
-          input_audio: { data: bytesToBase64(bytes), format: source.format },
-        },
-      ],
-    }],
-    modalities: ["text"],
-    max_tokens: 1200,
-  });
-  if (!result.text) throw new Error("语音识别未返回文本");
-  return result.text;
-}
-
 async function synthesizeVoice(env: RuntimeEnv, text: string): Promise<GeneratedAudio> {
   const result = await runOpenRouterAudio(env, {
     messages: [{
@@ -804,7 +998,7 @@ async function synthesizeVoice(env: RuntimeEnv, text: string): Promise<Generated
     max_tokens: 3500,
   });
   if (!result.audio.length) throw new Error("语音生成未返回音频数据");
-  return { bytes: pcm16ToWav(result.audio), format: "wav" };
+  return generatedVoice(result.audio);
 }
 
 async function generateAudioResponse(
@@ -819,7 +1013,7 @@ async function generateAudioResponse(
   });
   if (!result.text) throw new Error("音频模型未返回文本回复");
   if (!result.audio.length) throw new Error("音频模型未返回语音数据");
-  return { text: result.text, audio: { bytes: pcm16ToWav(result.audio), format: "wav" } };
+  return { text: result.text, audio: await generatedVoice(result.audio) };
 }
 
 function initialSessionState(): SessionState {
@@ -965,47 +1159,48 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
     });
   }
 
-  private async prepareTurn(turn: UserTurn, stage: string): Promise<string> {
-    if (!turn.audio) return turn.text;
-    await this.updateProgress(`${stage}：正在下载并识别语音…`, turn.text, true);
-    const transcript = await transcribeTelegramAudio(this.env, turn.audio, turn.text);
-    const prompt = [turn.text, transcript].filter(Boolean).join("\n\n");
-    await this.updateProgress(`${stage}：语音识别完成`, transcript, true);
-    return prompt;
+  private async prepareTurn(turn: UserTurn, stage: string): Promise<PreparedTurn> {
+    if (!turn.audio) {
+      return { displayText: turn.text, content: turn.text, audioMode: turn.audioMode };
+    }
+    await this.updateProgress(`${stage}：正在进行 OGG/Opus 音频转换…`, turn.text, true);
+    const input = await prepareAudioForGpt(this.env, turn.audio);
+    const displayText = turn.text || "[语音消息]";
+    await this.updateProgress(`${stage}：音频转换完成，正在端到端处理…`, displayText, true);
+    return {
+      displayText,
+      audioMode: true,
+      content: [
+        {
+          type: "text",
+          text: turn.text || "Listen to this voice message and respond naturally in the same language.",
+        },
+        { type: "input_audio", input_audio: input },
+      ],
+    };
   }
 
   private async runTurn(initialTurn: UserTurn): Promise<void> {
     const history = this.session.history.slice(-MAX_HISTORY_MESSAGES);
-    const prompt = await this.prepareTurn(initialTurn, "输入");
-    const turnInputs = [prompt];
+    const preparedInitial = await this.prepareTurn(initialTurn, "输入");
+    const turnInputs = [preparedInitial.displayText];
     const messages: ChatMessage[] = [
       { role: "system", content: systemPrompt(this.env) },
       ...history,
-      { role: "user", content: prompt },
+      { role: "user", content: preparedInitial.content },
     ];
     let finalText = "I could not complete the request.";
     let generatedAudio: GeneratedAudio | null = null;
+    let useAudioModel = preparedInitial.audioMode;
 
-    if (initialTurn.audioMode) {
-      for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+      let calls: ToolCall[] = [];
+      if (useAudioModel) {
         await this.updateProgress(`正在请求音频模型 · round ${round + 1}/${MAX_TOOL_ROUNDS}`, "", true);
         const result = await generateAudioResponse(this.env, messages);
         finalText = result.text;
         generatedAudio = result.audio;
-        const steering = this.takeSteering();
-        if (!steering.length) break;
-        messages.push({ role: "assistant", content: finalText });
-        for (const turn of steering) {
-          const instruction = await this.prepareTurn(turn, "Steering");
-          turnInputs.push(instruction);
-          messages.push({ role: "user", content: instruction });
-        }
-        await this.persist();
-        await this.updateProgress(`已合并 ${steering.length} 条 steering 指令，继续运行…`, "", true);
-      }
-    } else {
-
-      for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+      } else {
         await this.updateProgress(`正在请求模型 · round ${round + 1}/${MAX_TOOL_ROUNDS}`, "", true);
         const result = await runModel(
           this.env,
@@ -1017,7 +1212,7 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
         );
         const choiceMessage = result.choices?.[0]?.message;
         const candidate = String(result.response || choiceMessage?.content || finalText).trim();
-        const calls = Array.isArray(choiceMessage?.tool_calls)
+        calls = Array.isArray(choiceMessage?.tool_calls)
           ? choiceMessage.tool_calls
           : Array.isArray(result.tool_calls)
             ? result.tool_calls
@@ -1049,21 +1244,22 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
         } else {
           finalText = candidate || finalText;
         }
-
-        const steering = this.takeSteering();
-        if (steering.length) {
-          if (!calls.length) messages.push({ role: "assistant", content: finalText });
-          for (const turn of steering) {
-            const instruction = await this.prepareTurn(turn, "Steering");
-            turnInputs.push(instruction);
-            messages.push({ role: "user", content: instruction });
-          }
-          await this.persist();
-          await this.updateProgress(`已合并 ${steering.length} 条 steering 指令，继续运行…`, "", true);
-          continue;
-        }
-        if (!calls.length) break;
       }
+
+      const steering = this.takeSteering();
+      if (steering.length) {
+        if (!calls.length) messages.push({ role: "assistant", content: finalText });
+        for (const turn of steering) {
+          const prepared = await this.prepareTurn(turn, "Steering");
+          turnInputs.push(prepared.displayText);
+          messages.push({ role: "user", content: prepared.content });
+          if (prepared.audioMode) useAudioModel = true;
+        }
+        await this.persist();
+        await this.updateProgress(`已合并 ${steering.length} 条 steering 指令，继续运行…`, "", true);
+        continue;
+      }
+      if (!calls.length) break;
     }
 
     this.session.history = [
@@ -1190,7 +1386,7 @@ function audioSourceFromMessage(message: TelegramMessage): AudioSource | undefin
 function userTurnFromMessage(message: TelegramMessage): UserTurn | null {
   const audio = audioSourceFromMessage(message);
   let text = (audio ? message.caption : message.text)?.trim() || "";
-  const audioMode = !audio && /^\/audio(?:\s|$)/i.test(text);
+  const audioMode = Boolean(audio) || /^\/audio(?:\s|$)/i.test(text);
   if (audioMode) text = text.replace(/^\/audio(?:\s+|$)/i, "").trim() || "请用语音简短回复。";
   if (!audio && !text) return null;
   return { text, audio, voiceReply: Boolean(audio) || audioMode, audioMode };
