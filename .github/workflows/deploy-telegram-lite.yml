@@ -104,39 +104,38 @@ jobs:
             -H "x-telegram-bot-api-secret-token: $TELEGRAM_WEBHOOK_SECRET" \
             -H 'content-type: application/json' \
             --data-binary @/tmp/audio-smoke-update.json >/dev/null
+          sleep 75
           found_text=0
           found_voice=0
-          for attempt in $(seq 1 30); do
-            for candidate in $(seq $((seed_id + 1)) $((seed_id + 8))); do
-              payload=$(curl --silent -X POST "$api/forwardMessage" \
-                --data-urlencode "chat_id=$chat_id" \
-                --data-urlencode "from_chat_id=$chat_id" \
-                --data-urlencode "message_id=$candidate")
-              if ! jq -e '.ok == true' <<<"$payload" >/dev/null; then
-                continue
-              fi
-              forwarded_id=$(jq -r '.result.message_id' <<<"$payload")
-              curl --silent -X POST "$api/deleteMessage" \
-                --data-urlencode "chat_id=$chat_id" \
-                --data-urlencode "message_id=$forwarded_id" >/dev/null || true
-              if jq -e '.result.from.is_bot == true' <<<"$payload" >/dev/null; then
-                case " $bot_message_ids " in
-                  *" $candidate "*) ;;
-                  *) bot_message_ids="$bot_message_ids $candidate" ;;
-                esac
-              fi
-              if jq -e '.result.text // "" | contains("语音测试成功")' <<<"$payload" >/dev/null; then
-                found_text=1
-              fi
-              if jq -e '.result.voice.file_id | length > 0' <<<"$payload" >/dev/null 2>&1; then
-                found_voice=1
-              fi
-            done
-            if (( found_text == 1 && found_voice == 1 )); then
-              echo "Telegram /audio smoke passed: text and voice received"
-              exit 0
+          for candidate in $(seq $((seed_id + 1)) $((seed_id + 8))); do
+            payload=$(curl --silent -X POST "$api/forwardMessage" \
+              --data-urlencode "chat_id=$chat_id" \
+              --data-urlencode "from_chat_id=$chat_id" \
+              --data-urlencode "message_id=$candidate")
+            if ! jq -e '.ok == true' <<<"$payload" >/dev/null; then
+              continue
             fi
-            sleep 5
+            forwarded_id=$(jq -r '.result.message_id' <<<"$payload")
+            curl --silent -X POST "$api/deleteMessage" \
+              --data-urlencode "chat_id=$chat_id" \
+              --data-urlencode "message_id=$forwarded_id" >/dev/null || true
+            if jq -e '.result.from.is_bot == true' <<<"$payload" >/dev/null; then
+              case " $bot_message_ids " in
+                *" $candidate "*) ;;
+                *) bot_message_ids="$bot_message_ids $candidate" ;;
+              esac
+            fi
+            jq -r '["candidate", (.result.message_id|tostring), "text", ((.result.text // "")|.[0:160]), "voice", ((.result.voice.file_id? // "")|length|tostring)] | @tsv' <<<"$payload"
+            if jq -e '.result.text // "" | contains("语音测试成功")' <<<"$payload" >/dev/null; then
+              found_text=1
+            fi
+            if jq -e '.result.voice.file_id | length > 0' <<<"$payload" >/dev/null 2>&1; then
+              found_voice=1
+            fi
           done
+          if (( found_text == 1 && found_voice == 1 )); then
+            echo "Telegram /audio smoke passed: text and voice received"
+            exit 0
+          fi
           echo "Telegram /audio smoke failed: text=$found_text voice=$found_voice" >&2
           exit 1
