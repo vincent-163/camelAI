@@ -132,10 +132,9 @@ type PreparedTurn = {
 
 type SessionStatus = "idle" | "running" | "done" | "error";
 
-type ReplyMapping = {
-  sessionId: string;
-  kind: "progress" | "final";
-};
+type ReplyMapping =
+  | { sessionId: string; kind: "progress" }
+  | { sessionId: string; kind: "final"; history?: ChatMessage[] };
 
 type SessionState = {
   status: SessionStatus;
@@ -154,6 +153,7 @@ type StartTurnInput = {
   originMessageId: number;
   progressMessageId: number;
   turn: UserTurn;
+  baseHistory?: ChatMessage[];
 };
 
 type SteerInput = {
@@ -1042,6 +1042,17 @@ export class TelegramRouter extends DurableObject<RuntimeEnv> {
   async deleteReply(messageId: number): Promise<void> {
     await this.ctx.storage.delete(`reply:${messageId}`);
   }
+
+  async clearFinalHistory(sessionId: string): Promise<void> {
+    const replies = await this.ctx.storage.list<ReplyMapping>({ prefix: "reply:" });
+    const updates = new Map<string, ReplyMapping>();
+    for (const [key, mapping] of replies) {
+      if (mapping.kind === "final" && mapping.sessionId === sessionId) {
+        updates.set(key, { ...mapping, history: [] });
+      }
+    }
+    if (updates.size) await this.ctx.storage.put(Object.fromEntries(updates));
+  }
 }
 
 export class TelegramSession extends DurableObject<RuntimeEnv> {
@@ -1075,6 +1086,7 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
     this.session.chatId = input.chatId;
     this.session.originMessageId = input.originMessageId;
     this.session.progressMessageId = input.progressMessageId;
+    this.session.history = (input.baseHistory || []).slice(-MAX_HISTORY_MESSAGES);
     this.session.steering = [];
     this.session.voiceReply = input.turn.voiceReply;
     this.session.startedAt = Date.now();
@@ -1305,8 +1317,13 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
     if (chatId === null || originMessageId === null) return;
     const finalMessageIds = await sendTelegram(this.env, chatId, text, originMessageId);
     const router = this.env.TELEGRAM_ROUTER.getByName(String(chatId));
+    const mapping: ReplyMapping = {
+      sessionId: this.ctx.id.toString(),
+      kind: "final",
+      history: structuredClone(this.session.history),
+    };
     for (const messageId of finalMessageIds) {
-      await router.setReply(messageId, { sessionId: this.ctx.id.toString(), kind: "final" });
+      await router.setReply(messageId, mapping);
     }
     let audioMessageId: number | null = null;
     if (audio) {
@@ -1316,7 +1333,7 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
         audio,
         finalMessageIds.at(-1) || originMessageId,
       );
-      await router.setReply(audioMessageId, { sessionId: this.ctx.id.toString(), kind: "final" });
+      await router.setReply(audioMessageId, mapping);
     } else if (voiceError) {
       const warningIds = await sendTelegram(
         this.env,
@@ -1325,7 +1342,7 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
         finalMessageIds.at(-1) || originMessageId,
       );
       for (const messageId of warningIds) {
-        await router.setReply(messageId, { sessionId: this.ctx.id.toString(), kind: "final" });
+        await router.setReply(messageId, mapping);
       }
     }
     console.log("telegram session final published", {
@@ -1396,13 +1413,11 @@ async function startSession(
   env: RuntimeEnv,
   message: TelegramMessage,
   turn: UserTurn,
-  existingSessionId?: string,
+  baseHistory: ChatMessage[] = [],
 ): Promise<void> {
   const progressMessageId = await createProgress(env, message);
   const router = env.TELEGRAM_ROUTER.getByName(String(message.chat.id));
-  const sessionObjectId = existingSessionId
-    ? env.TELEGRAM_SESSIONS.idFromString(existingSessionId)
-    : env.TELEGRAM_SESSIONS.newUniqueId();
+  const sessionObjectId = env.TELEGRAM_SESSIONS.newUniqueId();
   const sessionId = sessionObjectId.toString();
   await router.setReply(progressMessageId, { sessionId, kind: "progress" });
   const session = env.TELEGRAM_SESSIONS.get(sessionObjectId);
@@ -1413,6 +1428,7 @@ async function startSession(
       originMessageId: message.message_id,
       progressMessageId,
       turn,
+      baseHistory,
     });
   } catch (error) {
     await router.deleteReply(progressMessageId);
@@ -1469,7 +1485,7 @@ async function processMessage(env: RuntimeEnv, message: TelegramMessage): Promis
     await sendTelegram(
       env,
       chatId,
-      `camelAI Telegram Lite 已连接 ${env.GITHUB_OWNER}/${env.GITHUB_REPO}。支持文本和语音输入；语音消息会同时返回文本和语音。普通消息创建新会话；回复最终消息继续会话；回复进行中消息可 steering。`,
+      `camelAI Telegram Lite 已连接 ${env.GITHUB_OWNER}/${env.GITHUB_REPO}。支持文本和语音输入；语音消息会同时返回文本和语音。普通消息创建新会话；回复任意最终消息会从该消息分支继续；回复进行中消息可 steering。`,
       message.message_id,
     );
     return;
@@ -1483,14 +1499,13 @@ async function processMessage(env: RuntimeEnv, message: TelegramMessage): Promis
   const mapping = repliedMessageId === undefined ? null : await router.getReply(repliedMessageId);
 
   if (isCommand && text === "/reset") {
-    if (!mapping) {
+    if (!mapping || mapping.kind !== "final") {
       await sendTelegram(env, chatId, "普通消息本来就会创建新会话；请回复某个最终消息后发送 /reset 来清空该会话。", message.message_id);
       return;
     }
-    const session = env.TELEGRAM_SESSIONS.get(env.TELEGRAM_SESSIONS.idFromString(mapping.sessionId));
     try {
-      await session.reset();
-      await sendTelegram(env, chatId, "该会话上下文已清空。", message.message_id);
+      await router.clearFinalHistory(mapping.sessionId);
+      await sendTelegram(env, chatId, "该回复分支点的上下文已清空。", message.message_id);
     } catch (error) {
       await sendTelegram(env, chatId, error instanceof Error ? error.message : String(error), message.message_id);
     }
@@ -1506,7 +1521,16 @@ async function processMessage(env: RuntimeEnv, message: TelegramMessage): Promis
     return;
   }
   if (mapping?.kind === "final") {
-    await startSession(env, message, turn, mapping.sessionId);
+    if (!mapping.history) {
+      await sendTelegram(
+        env,
+        chatId,
+        "该消息生成于分支快照功能上线前，无法准确排除后续对话；请从新的最终回复开始分支。",
+        message.message_id,
+      );
+      return;
+    }
+    await startSession(env, message, turn, mapping.history);
     return;
   }
   await startSession(env, message, turn);

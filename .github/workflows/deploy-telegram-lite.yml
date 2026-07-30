@@ -255,3 +255,9 @@ jobs:
           tail -200 /tmp/audio-smoke-tail.jsonl
           echo "Telegram audio smoke failed: audio_text=$found_text audio_voice=$found_voice input_text=$input_text input_voice=$input_voice" >&2
           exit 1
+      - name: Smoke test Telegram branching
+        if: github.event_name == 'workflow_dispatch' && inputs.audio_smoke
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+        run: python3 scripts/telegram-lite-branch-smoke.py
