@@ -32,6 +32,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Prepare Opus WASM for Workers
+        run: node scripts/prepare-telegram-lite-opus.mjs
       - name: Verify tested head
         if: github.event_name == 'workflow_run'
         env:
