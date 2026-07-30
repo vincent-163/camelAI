@@ -115,7 +115,7 @@ type UserTurn = {
 
 type GeneratedAudio = {
   bytes: Uint8Array;
-  format: "opus";
+  format: "wav";
 };
 
 type SessionStatus = "idle" | "running" | "done" | "error";
@@ -362,6 +362,33 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
   return result;
 }
 
+function pcm16ToWav(pcm: Uint8Array, sampleRate = 24_000, channels = 1): Uint8Array {
+  const headerSize = 44;
+  const wav = new Uint8Array(headerSize + pcm.length);
+  const view = new DataView(wav.buffer);
+  const writeAscii = (offset: number, value: string): void => {
+    for (let index = 0; index < value.length; index += 1) wav[offset + index] = value.charCodeAt(index);
+  };
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * channels * bitsPerSample / 8;
+  const blockAlign = channels * bitsPerSample / 8;
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + pcm.length, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeAscii(36, "data");
+  view.setUint32(40, pcm.length, true);
+  wav.set(pcm, headerSize);
+  return wav;
+}
+
 async function downloadTelegramAudio(env: RuntimeEnv, source: AudioSource): Promise<Uint8Array> {
   if (source.declaredSize && source.declaredSize > MAX_AUDIO_BYTES) {
     throw new Error(`语音文件过大，最大支持 ${Math.floor(MAX_AUDIO_BYTES / 1_000_000)} MB。`);
@@ -388,7 +415,7 @@ async function downloadTelegramAudio(env: RuntimeEnv, source: AudioSource): Prom
   return bytes;
 }
 
-async function sendTelegramVoice(
+async function sendTelegramAudio(
   env: RuntimeEnv,
   chatId: number,
   audio: GeneratedAudio,
@@ -398,10 +425,10 @@ async function sendTelegramVoice(
   body.set("chat_id", String(chatId));
   if (replyToMessageId) body.set("reply_to_message_id", String(replyToMessageId));
   const audioBuffer = Uint8Array.from(audio.bytes).buffer;
-  body.set("voice", new Blob([audioBuffer], { type: "audio/ogg" }), `camelai.${audio.format}`);
-  const payload = await telegramMultipartRequest(env, "sendVoice", body);
+  body.set("audio", new Blob([audioBuffer], { type: "audio/wav" }), `camelai.${audio.format}`);
+  const payload = await telegramMultipartRequest(env, "sendAudio", body);
   const messageId = payload.result?.message_id;
-  if (typeof messageId !== "number") throw new Error("Telegram sendVoice returned no message id");
+  if (typeof messageId !== "number") throw new Error("Telegram sendAudio returned no message id");
   return messageId;
 }
 
@@ -773,11 +800,11 @@ async function synthesizeVoice(env: RuntimeEnv, text: string): Promise<Generated
       content: `Read the following assistant response aloud naturally. Preserve its language and meaning. Do not add commentary.\n\n${text}`,
     }],
     modalities: ["text", "audio"],
-    audio: { voice: "alloy", format: "opus" },
+    audio: { voice: "alloy", format: "pcm16" },
     max_tokens: 3500,
   });
   if (!result.audio.length) throw new Error("语音生成未返回音频数据");
-  return { bytes: result.audio, format: "opus" };
+  return { bytes: pcm16ToWav(result.audio), format: "wav" };
 }
 
 async function generateAudioResponse(
@@ -787,12 +814,12 @@ async function generateAudioResponse(
   const result = await runOpenRouterAudio(env, {
     messages,
     modalities: ["text", "audio"],
-    audio: { voice: "alloy", format: "opus" },
+    audio: { voice: "alloy", format: "pcm16" },
     max_tokens: 3500,
   });
   if (!result.text) throw new Error("音频模型未返回文本回复");
   if (!result.audio.length) throw new Error("音频模型未返回语音数据");
-  return { text: result.text, audio: { bytes: result.audio, format: "opus" } };
+  return { text: result.text, audio: { bytes: pcm16ToWav(result.audio), format: "wav" } };
 }
 
 function initialSessionState(): SessionState {
@@ -1085,15 +1112,15 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
     for (const messageId of finalMessageIds) {
       await router.setReply(messageId, { sessionId: this.ctx.id.toString(), kind: "final" });
     }
-    let voiceMessageId: number | null = null;
+    let audioMessageId: number | null = null;
     if (audio) {
-      voiceMessageId = await sendTelegramVoice(
+      audioMessageId = await sendTelegramAudio(
         this.env,
         chatId,
         audio,
         finalMessageIds.at(-1) || originMessageId,
       );
-      await router.setReply(voiceMessageId, { sessionId: this.ctx.id.toString(), kind: "final" });
+      await router.setReply(audioMessageId, { sessionId: this.ctx.id.toString(), kind: "final" });
     } else if (voiceError) {
       const warningIds = await sendTelegram(
         this.env,
@@ -1109,7 +1136,7 @@ export class TelegramSession extends DurableObject<RuntimeEnv> {
       sessionId: this.ctx.id.toString(),
       chatId,
       finalMessageIds,
-      voiceMessageId,
+      audioMessageId,
     });
     if (progressMessageId !== null) {
       await router.deleteReply(progressMessageId);

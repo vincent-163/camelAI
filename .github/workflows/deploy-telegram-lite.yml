@@ -92,7 +92,7 @@ jobs:
             > /tmp/audio-smoke-tail.jsonl 2>&1 &
           tail_pid=$!
           sleep 8
-          for format in opus mp3 wav; do
+          for format in pcm16; do
             jq -n --arg format "$format" '{model:"openai/gpt-audio",messages:[{role:"user",content:"Say audio test."}],modalities:["text","audio"],audio:{voice:"alloy",format:$format},max_tokens:32,stream:true}' \
               > "/tmp/openrouter-$format-request.json"
             status=$(curl --silent --show-error \
@@ -180,18 +180,18 @@ jobs:
                 *) bot_message_ids="$bot_message_ids $candidate" ;;
               esac
             fi
-            jq -r '["candidate", (.result.message_id|tostring), "text", ((.result.text // "")|.[0:160]), "voice", ((.result.voice.file_id? // "")|length|tostring)] | @tsv' <<<"$payload"
+            jq -r '["candidate", (.result.message_id|tostring), "text", ((.result.text // "")|.[0:160]), "audio", ((.result.audio.file_id? // "")|length|tostring)] | @tsv' <<<"$payload"
             if jq -e '.result.text // "" | contains("语音测试成功")' <<<"$payload" >/dev/null; then
               found_text=1
             fi
-            if jq -e '.result.voice.file_id | length > 0' <<<"$payload" >/dev/null 2>&1; then
+            if jq -e '.result.audio.file_id | length > 0' <<<"$payload" >/dev/null 2>&1; then
               found_voice=1
             fi
           done
           if (( found_text == 1 && found_voice == 1 )); then
             kill "$tail_pid" >/dev/null 2>&1 || true
             wait "$tail_pid" >/dev/null 2>&1 || true
-            echo "Telegram /audio smoke passed: text and voice received"
+            echo "Telegram /audio smoke passed: text and playable audio received"
             exit 0
           fi
           kill "$tail_pid" >/dev/null 2>&1 || true
