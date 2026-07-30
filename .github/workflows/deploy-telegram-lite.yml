@@ -76,6 +76,8 @@ jobs:
       - name: Smoke test Telegram audio
         if: github.event_name == 'workflow_dispatch' && inputs.audio_smoke
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
         run: |
@@ -83,6 +85,12 @@ jobs:
           chat_id=524019827
           api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
           worker='https://camelai-telegram-172a28c1.ouihfugxhcqe.workers.dev/telegram/webhook'
+          timeout 110 npm exec --yes wrangler@4.115.0 -- tail \
+            --format json \
+            --config workers/telegram-lite/wrangler.jsonc \
+            > /tmp/audio-smoke-tail.jsonl 2>&1 &
+          tail_pid=$!
+          sleep 8
           seed_id=$(curl --fail-with-body --silent --show-error -X POST "$api/sendMessage" \
             --data-urlencode "chat_id=$chat_id" \
             --data-urlencode 'text=camelAI /audio smoke test' | jq -r '.result.message_id')
@@ -134,8 +142,14 @@ jobs:
             fi
           done
           if (( found_text == 1 && found_voice == 1 )); then
+            kill "$tail_pid" >/dev/null 2>&1 || true
+            wait "$tail_pid" >/dev/null 2>&1 || true
             echo "Telegram /audio smoke passed: text and voice received"
             exit 0
           fi
+          kill "$tail_pid" >/dev/null 2>&1 || true
+          wait "$tail_pid" >/dev/null 2>&1 || true
+          echo '--- Worker tail ---'
+          tail -200 /tmp/audio-smoke-tail.jsonl
           echo "Telegram /audio smoke failed: text=$found_text voice=$found_voice" >&2
           exit 1
