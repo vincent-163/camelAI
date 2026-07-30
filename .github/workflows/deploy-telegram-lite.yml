@@ -43,6 +43,7 @@ jobs:
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
           CAMELAI_REPO_TOKEN: ${{ secrets.CAMELAI_REPO_TOKEN }}
           CAMELAI_AI_API_KEY: ${{ secrets.CAMELAI_AI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           umask 077
           jq -n \
@@ -50,7 +51,8 @@ jobs:
             --arg webhook "$TELEGRAM_WEBHOOK_SECRET" \
             --arg github "$CAMELAI_REPO_TOKEN" \
             --arg ai "$CAMELAI_AI_API_KEY" \
-            '{TELEGRAM_BOT_TOKEN:$telegram,TELEGRAM_WEBHOOK_SECRET:$webhook,GITHUB_TOKEN:$github,AI_API_KEY:$ai}' \
+            --arg openrouter "$OPENROUTER_API_KEY" \
+            '{TELEGRAM_BOT_TOKEN:$telegram,TELEGRAM_WEBHOOK_SECRET:$webhook,GITHUB_TOKEN:$github,AI_API_KEY:$ai,OPENROUTER_API_KEY:$openrouter}' \
             > /tmp/camelai-secrets.json
           npm exec --yes wrangler@4.115.0 -- secret bulk /tmp/camelai-secrets.json \
             --config workers/telegram-lite/wrangler.jsonc
