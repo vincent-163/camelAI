@@ -1,5 +1,7 @@
 /// <reference path="../worker-configuration.d.ts" />
 
+import { DurableObject } from "cloudflare:workers";
+
 type RuntimeEnv = Env & {
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
@@ -12,6 +14,7 @@ type TelegramMessage = {
   text?: string;
   chat: { id: number };
   from?: { username?: string; first_name?: string; last_name?: string };
+  reply_to_message?: TelegramMessage;
 };
 
 type TelegramUpdate = {
@@ -45,6 +48,47 @@ type AiResponse = {
       tool_calls?: ToolCall[];
     };
   }>;
+};
+
+type SessionStatus = "idle" | "running" | "done" | "error";
+
+type ReplyMapping = {
+  sessionId: string;
+  kind: "progress" | "final";
+};
+
+type SessionState = {
+  status: SessionStatus;
+  chatId: number | null;
+  originMessageId: number | null;
+  progressMessageId: number | null;
+  history: ChatMessage[];
+  steering: string[];
+  startedAt: number | null;
+  updatedAt: number;
+};
+
+type StartTurnInput = {
+  chatId: number;
+  originMessageId: number;
+  progressMessageId: number;
+  prompt: string;
+};
+
+type SteerInput = {
+  previousProgressMessageId: number;
+  progressMessageId: number;
+  prompt: string;
+};
+
+type TelegramSentMessage = {
+  message_id: number;
+};
+
+type TelegramApiResponse<T> = {
+  ok?: boolean;
+  description?: string;
+  result?: T;
 };
 
 const MAX_HISTORY_MESSAGES = 12;
@@ -205,14 +249,40 @@ async function telegramRequest(
   return payload;
 }
 
-async function sendTelegram(env: RuntimeEnv, chatId: number, text: string): Promise<void> {
+async function sendTelegram(
+  env: RuntimeEnv,
+  chatId: number,
+  text: string,
+  replyToMessageId?: number,
+): Promise<number[]> {
+  const messageIds: number[] = [];
+  let replyTo = replyToMessageId;
   for (const chunk of chunkText(text)) {
-    await telegramRequest(env, "sendMessage", {
+    const payload = await telegramRequest(env, "sendMessage", {
       chat_id: chatId,
       text: chunk,
       disable_web_page_preview: true,
-    });
+      ...(replyTo ? { reply_to_message_id: replyTo } : {}),
+    }) as TelegramApiResponse<TelegramSentMessage>;
+    const messageId = payload.result?.message_id;
+    if (typeof messageId !== "number") throw new Error("Telegram sendMessage returned no message id");
+    messageIds.push(messageId);
+    replyTo = messageId;
   }
+  return messageIds;
+}
+
+async function editTelegram(env: RuntimeEnv, chatId: number, messageId: number, text: string): Promise<void> {
+  await telegramRequest(env, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    disable_web_page_preview: true,
+  });
+}
+
+async function deleteTelegram(env: RuntimeEnv, chatId: number, messageId: number): Promise<void> {
+  await telegramRequest(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
 }
 
 async function githubRequest<T>(
@@ -372,54 +442,279 @@ async function runModel(env: RuntimeEnv, messages: ChatMessage[]): Promise<AiRes
   return payload;
 }
 
-async function runAgent(env: RuntimeEnv, chatId: number, prompt: string): Promise<string> {
-  const key = `chat:${chatId}`;
-  const history = await env.SESSIONS.get<ChatMessage[]>(key, "json") || [];
-  const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt(env) },
-    ...history.slice(-MAX_HISTORY_MESSAGES),
-    { role: "user", content: prompt },
-  ];
+function initialSessionState(): SessionState {
+  return {
+    status: "idle",
+    chatId: null,
+    originMessageId: null,
+    progressMessageId: null,
+    history: [],
+    steering: [],
+    startedAt: null,
+    updatedAt: Date.now(),
+  };
+}
 
-  let finalText = "I could not complete the request.";
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-    const result = await runModel(env, messages);
-    const choiceMessage = result.choices?.[0]?.message;
-    const calls = Array.isArray(choiceMessage?.tool_calls)
-      ? choiceMessage.tool_calls
-      : Array.isArray(result.tool_calls)
-        ? result.tool_calls
-        : [];
-    if (!calls.length) {
-      finalText = String(result.response || choiceMessage?.content || finalText).trim();
-      break;
-    }
-    messages.push({
-      role: "assistant",
-      content: String(result.response || choiceMessage?.content || ""),
-      tool_calls: calls,
-    });
-    for (let index = 0; index < calls.length; index += 1) {
-      const call = calls[index];
-      const id = toolId(call, index);
-      const name = toolName(call);
-      let output: unknown;
-      try {
-        output = await executeTool(env, name, parseArguments(call));
-      } catch (error) {
-        output = { error: error instanceof Error ? error.message : String(error) };
-      }
-      messages.push({ role: "tool", tool_call_id: id, content: JSON.stringify(output) });
-    }
+export class TelegramRouter extends DurableObject<RuntimeEnv> {
+  async getReply(messageId: number): Promise<ReplyMapping | null> {
+    return await this.ctx.storage.get<ReplyMapping>(`reply:${messageId}`) ?? null;
   }
 
-  const nextHistory: ChatMessage[] = [
-    ...history,
-    { role: "user", content: prompt },
-    { role: "assistant", content: finalText },
-  ].slice(-MAX_HISTORY_MESSAGES);
-  await env.SESSIONS.put(key, JSON.stringify(nextHistory), { expirationTtl: 60 * 60 * 24 * 30 });
-  return finalText;
+  async setReply(messageId: number, mapping: ReplyMapping): Promise<void> {
+    await this.ctx.storage.put(`reply:${messageId}`, mapping);
+  }
+
+  async deleteReply(messageId: number): Promise<void> {
+    await this.ctx.storage.delete(`reply:${messageId}`);
+  }
+}
+
+export class TelegramSession extends DurableObject<RuntimeEnv> {
+  private session = initialSessionState();
+  private runPromise: Promise<void> | null = null;
+
+  constructor(ctx: DurableObjectState, env: RuntimeEnv) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(async () => {
+      this.session = await ctx.storage.get<SessionState>("session") ?? initialSessionState();
+      if (this.session.status === "running") {
+        this.session.status = "error";
+        this.session.updatedAt = Date.now();
+        await ctx.storage.put("session", this.session);
+      }
+    });
+  }
+
+  async startTurn(input: StartTurnInput): Promise<{ accepted: boolean; status: SessionStatus }> {
+    if (this.session.status === "running") {
+      return { accepted: false, status: this.session.status };
+    }
+    this.session.status = "running";
+    this.session.chatId = input.chatId;
+    this.session.originMessageId = input.originMessageId;
+    this.session.progressMessageId = input.progressMessageId;
+    this.session.steering = [];
+    this.session.startedAt = Date.now();
+    this.session.updatedAt = Date.now();
+    await this.persist();
+    this.runPromise = this.runTurn(input.prompt)
+      .catch((error) => this.finishWithError(error))
+      .finally(() => {
+        this.runPromise = null;
+      });
+    this.ctx.waitUntil(this.runPromise);
+    console.log("telegram session turn started", {
+      sessionId: this.ctx.id.toString(),
+      chatId: input.chatId,
+      progressMessageId: input.progressMessageId,
+    });
+    return { accepted: true, status: this.session.status };
+  }
+
+  async steer(input: SteerInput): Promise<{ accepted: boolean; status: SessionStatus }> {
+    if (
+      this.session.status !== "running" ||
+      this.session.progressMessageId !== input.previousProgressMessageId
+    ) {
+      return { accepted: false, status: this.session.status };
+    }
+    this.session.steering.push(input.prompt);
+    this.session.progressMessageId = input.progressMessageId;
+    this.session.updatedAt = Date.now();
+    await this.persist();
+    console.log("telegram session steering queued", {
+      sessionId: this.ctx.id.toString(),
+      previousProgressMessageId: input.previousProgressMessageId,
+      progressMessageId: input.progressMessageId,
+    });
+    return { accepted: true, status: this.session.status };
+  }
+
+  async reset(): Promise<void> {
+    if (this.session.status === "running") throw new Error("Cannot reset a running session");
+    this.session = initialSessionState();
+    await this.persist();
+  }
+
+  async getStatus(): Promise<SessionState> {
+    return structuredClone(this.session);
+  }
+
+  private async persist(): Promise<void> {
+    await this.ctx.storage.put("session", this.session);
+  }
+
+  private takeSteering(): string[] {
+    const steering = this.session.steering;
+    this.session.steering = [];
+    return steering;
+  }
+
+  private async runTurn(prompt: string): Promise<void> {
+    const history = this.session.history.slice(-MAX_HISTORY_MESSAGES);
+    const turnInputs = [prompt];
+    const messages: ChatMessage[] = [
+      { role: "system", content: systemPrompt(this.env) },
+      ...history,
+      { role: "user", content: prompt },
+    ];
+    let finalText = "I could not complete the request.";
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+      const result = await runModel(this.env, messages);
+      const choiceMessage = result.choices?.[0]?.message;
+      const candidate = String(result.response || choiceMessage?.content || finalText).trim();
+      const calls = Array.isArray(choiceMessage?.tool_calls)
+        ? choiceMessage.tool_calls
+        : Array.isArray(result.tool_calls)
+          ? result.tool_calls
+          : [];
+
+      if (calls.length) {
+        messages.push({
+          role: "assistant",
+          content: String(result.response || choiceMessage?.content || ""),
+          tool_calls: calls,
+        });
+        for (let index = 0; index < calls.length; index += 1) {
+          const call = calls[index];
+          const id = toolId(call, index);
+          const name = toolName(call);
+          let output: unknown;
+          try {
+            output = await executeTool(this.env, name, parseArguments(call));
+          } catch (error) {
+            output = { error: error instanceof Error ? error.message : String(error) };
+          }
+          messages.push({ role: "tool", tool_call_id: id, content: JSON.stringify(output) });
+        }
+      } else {
+        finalText = candidate || finalText;
+      }
+
+      const steering = this.takeSteering();
+      if (steering.length) {
+        if (!calls.length) messages.push({ role: "assistant", content: finalText });
+        for (const instruction of steering) {
+          turnInputs.push(instruction);
+          messages.push({ role: "user", content: instruction });
+        }
+        await this.persist();
+        continue;
+      }
+      if (!calls.length) break;
+    }
+
+    this.session.history = [
+      ...history,
+      ...turnInputs.map((content): ChatMessage => ({ role: "user", content })),
+      { role: "assistant", content: finalText },
+    ].slice(-MAX_HISTORY_MESSAGES);
+    this.session.status = "done";
+    this.session.updatedAt = Date.now();
+    await this.persist();
+    await this.publishFinal(finalText);
+  }
+
+  private async finishWithError(error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("telegram session failed", { message });
+    this.session.status = "error";
+    this.session.updatedAt = Date.now();
+    await this.persist();
+    await this.publishFinal(`处理失败：${message}`).catch((publishError) => {
+      console.error("telegram error reply failed", {
+        message: publishError instanceof Error ? publishError.message : String(publishError),
+      });
+    });
+  }
+
+  private async publishFinal(text: string): Promise<void> {
+    const { chatId, originMessageId, progressMessageId } = this.session;
+    if (chatId === null || originMessageId === null) return;
+    const finalMessageIds = await sendTelegram(this.env, chatId, text, originMessageId);
+    const router = this.env.TELEGRAM_ROUTER.getByName(String(chatId));
+    for (const messageId of finalMessageIds) {
+      await router.setReply(messageId, { sessionId: this.ctx.id.toString(), kind: "final" });
+    }
+    console.log("telegram session final published", {
+      sessionId: this.ctx.id.toString(),
+      chatId,
+      finalMessageIds,
+    });
+    if (progressMessageId !== null) {
+      await router.deleteReply(progressMessageId);
+      await deleteTelegram(this.env, chatId, progressMessageId).catch(() => undefined);
+    }
+  }
+}
+
+async function createProgress(env: RuntimeEnv, message: TelegramMessage, text = "🟡 IN PROGRESS"): Promise<number> {
+  const messageIds = await sendTelegram(env, message.chat.id, text, message.message_id);
+  return messageIds[0];
+}
+
+async function startSession(
+  env: RuntimeEnv,
+  message: TelegramMessage,
+  prompt: string,
+  existingSessionId?: string,
+): Promise<void> {
+  const progressMessageId = await createProgress(env, message);
+  const router = env.TELEGRAM_ROUTER.getByName(String(message.chat.id));
+  const sessionObjectId = existingSessionId
+    ? env.TELEGRAM_SESSIONS.idFromString(existingSessionId)
+    : env.TELEGRAM_SESSIONS.newUniqueId();
+  const sessionId = sessionObjectId.toString();
+  await router.setReply(progressMessageId, { sessionId, kind: "progress" });
+  const session = env.TELEGRAM_SESSIONS.get(sessionObjectId);
+  let result: { accepted: boolean; status: SessionStatus };
+  try {
+    result = await session.startTurn({
+      chatId: message.chat.id,
+      originMessageId: message.message_id,
+      progressMessageId,
+      prompt,
+    });
+  } catch (error) {
+    await router.deleteReply(progressMessageId);
+    await editTelegram(
+      env,
+      message.chat.id,
+      progressMessageId,
+      `❌ ERROR\n${error instanceof Error ? error.message : String(error)}`,
+    ).catch(() => undefined);
+    throw error;
+  }
+  if (!result.accepted) {
+    await router.deleteReply(progressMessageId);
+    await editTelegram(env, message.chat.id, progressMessageId, "⚠️ SESSION BUSY");
+  }
+}
+
+async function steerSession(
+  env: RuntimeEnv,
+  message: TelegramMessage,
+  prompt: string,
+  mapping: ReplyMapping,
+  previousProgressMessageId: number,
+): Promise<void> {
+  const progressMessageId = await createProgress(env, message, "🟡 IN PROGRESS\n(steer accepted…)");
+  const router = env.TELEGRAM_ROUTER.getByName(String(message.chat.id));
+  const session = env.TELEGRAM_SESSIONS.get(env.TELEGRAM_SESSIONS.idFromString(mapping.sessionId));
+  const result = await session.steer({ previousProgressMessageId, progressMessageId, prompt });
+  if (!result.accepted) {
+    await editTelegram(env, message.chat.id, progressMessageId, "⚠️ Steering 未接受：当前会话已不在运行中。");
+    return;
+  }
+  await router.deleteReply(previousProgressMessageId);
+  await router.setReply(progressMessageId, { sessionId: mapping.sessionId, kind: "progress" });
+  await editTelegram(
+    env,
+    message.chat.id,
+    previousProgressMessageId,
+    "↪ STEER ACCEPTED\nContinuing in the newer progress message.",
+  ).catch(() => undefined);
 }
 
 async function processMessage(env: RuntimeEnv, message: TelegramMessage): Promise<void> {
@@ -434,22 +729,44 @@ async function processMessage(env: RuntimeEnv, message: TelegramMessage): Promis
     await sendTelegram(
       env,
       chatId,
-      `camelAI Telegram Lite 已连接 ${env.GITHUB_OWNER}/${env.GITHUB_REPO}。直接描述要检查、修改或提交的任务即可。`,
+      `camelAI Telegram Lite 已连接 ${env.GITHUB_OWNER}/${env.GITHUB_REPO}。普通消息创建新会话；回复最终消息继续会话；回复进行中消息可 steering。`,
+      message.message_id,
     );
     return;
   }
-  if (text === "/reset") {
-    await env.SESSIONS.delete(`chat:${chatId}`);
-    await sendTelegram(env, chatId, "会话上下文已清空。");
-    return;
-  }
   if (text === "/status") {
-    await sendTelegram(env, chatId, JSON.stringify(await getCiStatus(env), null, 2));
+    await sendTelegram(env, chatId, JSON.stringify(await getCiStatus(env), null, 2), message.message_id);
     return;
   }
+  const repliedMessageId = message.reply_to_message?.message_id;
+  const router = env.TELEGRAM_ROUTER.getByName(String(chatId));
+  const mapping = repliedMessageId === undefined ? null : await router.getReply(repliedMessageId);
+
+  if (text === "/reset") {
+    if (!mapping) {
+      await sendTelegram(env, chatId, "普通消息本来就会创建新会话；请回复某个最终消息后发送 /reset 来清空该会话。", message.message_id);
+      return;
+    }
+    const session = env.TELEGRAM_SESSIONS.get(env.TELEGRAM_SESSIONS.idFromString(mapping.sessionId));
+    try {
+      await session.reset();
+      await sendTelegram(env, chatId, "该会话上下文已清空。", message.message_id);
+    } catch (error) {
+      await sendTelegram(env, chatId, error instanceof Error ? error.message : String(error), message.message_id);
+    }
+    return;
+  }
+
   await telegramRequest(env, "sendChatAction", { chat_id: chatId, action: "typing" });
-  const response = await runAgent(env, chatId, text);
-  await sendTelegram(env, chatId, response);
+  if (mapping?.kind === "progress" && repliedMessageId !== undefined) {
+    await steerSession(env, message, text, mapping, repliedMessageId);
+    return;
+  }
+  if (mapping?.kind === "final") {
+    await startSession(env, message, text, mapping.sessionId);
+    return;
+  }
+  await startSession(env, message, text);
 }
 
 export default {
