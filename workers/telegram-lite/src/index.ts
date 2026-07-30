@@ -4,6 +4,7 @@ type RuntimeEnv = Env & {
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   GITHUB_TOKEN: string;
+  AI_API_KEY: string;
 };
 
 type TelegramMessage = {
@@ -350,6 +351,27 @@ function systemPrompt(env: RuntimeEnv): string {
   ].join("\n");
 }
 
+async function runModel(env: RuntimeEnv, messages: ChatMessage[]): Promise<AiResponse> {
+  const response = await fetch(`${env.AI_BASE_URL.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.AI_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: env.AI_MODEL,
+      messages,
+      tools,
+      max_tokens: 3500,
+    }),
+  });
+  const payload = await response.json<AiResponse & { error?: { message?: string } }>();
+  if (!response.ok) {
+    throw new Error(payload.error?.message || `AI API failed (${response.status})`);
+  }
+  return payload;
+}
+
 async function runAgent(env: RuntimeEnv, chatId: number, prompt: string): Promise<string> {
   const key = `chat:${chatId}`;
   const history = await env.SESSIONS.get<ChatMessage[]>(key, "json") || [];
@@ -361,11 +383,7 @@ async function runAgent(env: RuntimeEnv, chatId: number, prompt: string): Promis
 
   let finalText = "I could not complete the request.";
   for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-    const result = await env.AI.run(env.AI_MODEL as keyof AiModels, {
-      messages,
-      tools,
-      max_tokens: 3500,
-    }) as AiResponse;
+    const result = await runModel(env, messages);
     const choiceMessage = result.choices?.[0]?.message;
     const calls = Array.isArray(choiceMessage?.tool_calls)
       ? choiceMessage.tool_calls

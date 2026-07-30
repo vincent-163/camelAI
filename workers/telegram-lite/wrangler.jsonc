@@ -17,10 +17,8 @@
     "GITHUB_OWNER": "vincent-163",
     "GITHUB_REPO": "camelAI",
     "GITHUB_BRANCH": "main",
-    "AI_MODEL": "@cf/qwen/qwen3-30b-a3b-fp8"
-  },
-  "ai": {
-    "binding": "AI"
+    "AI_BASE_URL": "https://workers.v-163.top/ai/v1",
+    "AI_MODEL": "gpt-5.6-sol"
   },
   "kv_namespaces": [
     {
