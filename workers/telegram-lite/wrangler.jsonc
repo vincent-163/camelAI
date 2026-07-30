@@ -3,7 +3,6 @@
   "name": "camelai-telegram-172a28c1",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-29",
-  "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "observability": {
     "enabled": true,
